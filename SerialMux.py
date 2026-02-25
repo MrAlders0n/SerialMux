@@ -136,10 +136,12 @@ def main():
             if fd == ser_fd:
                 # Serial → broadcast to alive vports (including idle — they buffer writes)
                 try:
-                    data = ser.read(ser.in_waiting or 1)
+                    data = os.read(ser_fd, 4096)
                     if not data:
+                        raise OSError("serial port returned EOF")
+                except OSError as e:
+                    if e.errno == errno.EAGAIN or e.errno == errno.EINTR:
                         continue
-                except (serial.SerialException, OSError) as e:
                     log.warning(f"Serial read failed: {e} — reconnecting")
                     try:
                         ser.close()
