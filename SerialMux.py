@@ -72,7 +72,7 @@ def open_serial(port, baud):
     """Open serial port with retry loop. Returns serial.Serial instance."""
     while True:
         try:
-            ser = serial.Serial(port, baud, timeout=0)
+            ser = serial.Serial(port, baud, timeout=0.1)
             log.info(f"Serial port {port} opened successfully (fd={ser.fileno()})")
             return ser
         except serial.SerialException as e:
