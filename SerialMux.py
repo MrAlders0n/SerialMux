@@ -52,7 +52,7 @@ def create_vport(path):
     fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
     log.info(f"Virtual port created: {path} -> {slave_name} (master fd={master})")
-    return {'master_fd': master, 'path': path, 'slave_name': slave_name, 'alive': True}
+    return {'master_fd': master, 'path': path, 'slave_name': slave_name, 'alive': True, 'idle': True}
 
 
 def recreate_vport(vport):
@@ -114,14 +114,14 @@ def main():
     last_stats = time.monotonic()
 
     while True:
-        # 1. Build watch_fds from serial fd + alive vports only (Bug 3)
+        # 1. Build watch_fds from serial fd + alive, non-idle vports (Bug 3)
         try:
             ser_fd = ser.fileno()
         except Exception:
             ser_fd = -1
 
-        alive_vports = [v for v in vports if v['alive']]
-        watch_fds = [ser_fd] + [v['master_fd'] for v in alive_vports] if ser_fd >= 0 else [v['master_fd'] for v in alive_vports]
+        active_vports = [v for v in vports if v['alive'] and not v['idle']]
+        watch_fds = [ser_fd] + [v['master_fd'] for v in active_vports] if ser_fd >= 0 else [v['master_fd'] for v in active_vports]
 
         # 2. select() with EINTR handling (Bug 6)
         try:
@@ -134,7 +134,7 @@ def main():
         # 3. Process readable fds
         for fd in readable:
             if fd == ser_fd:
-                # Serial → broadcast to alive vports
+                # Serial → broadcast to alive vports (including idle — they buffer writes)
                 try:
                     data = ser.read(ser.in_waiting or 1)
                     if not data:
@@ -150,36 +150,33 @@ def main():
 
                 bytes_from_device += len(data)
                 log.debug(f"Device -> vports: {len(data)} bytes")
-                for v in alive_vports:
+                for v in [v for v in vports if v['alive']]:
                     try:
                         os.write(v['master_fd'], data)
                     except OSError as e:
-                        if e.errno == errno.EAGAIN:
-                            log.debug(f"Write to {v['path']} would block — dropping data")
-                        elif e.errno == errno.EIO:
-                            log.info(f"EIO on write to {v['path']} — marking dead")
-                            v['alive'] = False
+                        if e.errno in (errno.EAGAIN, errno.EIO):
+                            log.debug(f"Write to {v['path']} skipped ({os.strerror(e.errno)})")
                         else:
                             log.warning(f"Write to {v['path']} failed: {e} — marking dead")
                             v['alive'] = False
 
             else:
                 # vport master → serial
-                v = next((v for v in alive_vports if v['master_fd'] == fd), None)
+                v = next((v for v in active_vports if v['master_fd'] == fd), None)
                 if v is None:
                     continue
                 try:
                     data = os.read(fd, 4096)
                     if not data:
-                        log.info(f"EOF on {v['path']} — marking dead")
-                        v['alive'] = False
+                        log.info(f"EOF on {v['path']} — client disconnected")
+                        v['idle'] = True
                         continue
                 except OSError as e:
                     if e.errno == errno.EAGAIN or e.errno == errno.EINTR:
                         continue
                     elif e.errno == errno.EIO:
-                        log.info(f"EIO on read from {v['path']} — marking dead")
-                        v['alive'] = False
+                        log.info(f"EIO on read from {v['path']} — client disconnected")
+                        v['idle'] = True
                         continue
                     else:
                         log.warning(f"Read from {v['path']} failed: {e} — marking dead")
@@ -199,17 +196,37 @@ def main():
                     ser = open_serial(REAL_PORT, BAUD)
                     break
 
-        # 4. Recreate dead vports (Bug 4)
+        # 4. Probe idle vports — check if a client has connected
+        for v in vports:
+            if v['alive'] and v['idle']:
+                try:
+                    os.read(v['master_fd'], 1)
+                    # Got data — client is connected
+                    v['idle'] = False
+                    log.info(f"Client connected to {v['path']}")
+                except OSError as e:
+                    if e.errno == errno.EAGAIN:
+                        # No data but no error — client is connected
+                        v['idle'] = False
+                        log.info(f"Client connected to {v['path']}")
+                    elif e.errno == errno.EIO:
+                        pass  # Still no client — stay idle
+                    else:
+                        log.warning(f"Probe of {v['path']} failed: {e} — marking dead")
+                        v['alive'] = False
+
+        # 5. Recreate dead vports (Bug 4)
         for i, v in enumerate(vports):
             if not v['alive']:
                 vports[i] = recreate_vport(v)
         _active_vports = vports
 
-        # 5. Log stats every 60s
+        # 6. Log stats every 60s
         now = time.monotonic()
         if now - last_stats >= 60.0:
             alive_count = sum(1 for v in vports if v['alive'])
-            log.info(f"Stats: {bytes_from_device} bytes in, {bytes_to_device} bytes out, {alive_count}/{len(vports)} vports alive")
+            idle_count = sum(1 for v in vports if v['alive'] and v['idle'])
+            log.info(f"Stats: {bytes_from_device} bytes in, {bytes_to_device} bytes out, {alive_count}/{len(vports)} alive, {idle_count} idle")
             last_stats = now
 
 
